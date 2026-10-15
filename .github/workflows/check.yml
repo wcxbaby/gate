@@ -40,6 +40,10 @@ jobs:
           CHECK_CONCURRENCY: "24"
           CHECK_TIMEOUT: "90"
           NODES_URL: "https://wcxbaby.github.io/gate/nodes.txt"
+          # 优选入口按运营商分线路：公司用联通，家里用移动
+          # 生成的 nodes.txt 中，节点备注会带「联通-」「移动-」前缀以便区分
+          OPTIMAL_API_CU: "https://cf.090227.xyz/cu?ips=8&port=443"
+          OPTIMAL_API_CMCC: "https://cf.090227.xyz/cmcc?ips=8&port=443"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
