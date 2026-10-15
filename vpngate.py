@@ -100,8 +100,16 @@ EDGE_HOSTS = [
     if h.strip()
 ]
 
-# 优选 API（Cloudflare 优选 IP 接口），可逗号分隔多个
-OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=6&port=443")
+# 优选 API：按运营商分线路生成入口
+# 背景：edgetunnel 订阅里的「入口地址」决定客户端连哪个 CF 边缘 IP。
+#       不同宽带应各用各的运营商优选，因此这里分别为联通 / 移动各生成一套
+#       带 [联通] / [移动] 标签的节点，客户端可按所在地选对应分组。
+ISP_LINES = [
+    ("联通", os.environ.get("OPTIMAL_API_CU", "https://cf.090227.xyz/cu?ips=8&port=443")),
+    ("移动", os.environ.get("OPTIMAL_API_CMCC", "https://cf.090227.xyz/cmcc?ips=8&port=443")),
+]
+# 兼容旧变量（若显式设置 OPTIMAL_API，则作为额外线路并入）
+OPTIMAL_API = os.environ.get("OPTIMAL_API", "").strip()
 
 NODES_URL = os.environ.get("NODES_URL", "").strip()
 
@@ -254,16 +262,48 @@ def fetch_optimal_api_endpoints(api_urls_str):
     return endpoints
 
 def get_combined_edge_hosts():
+    """
+    汇总入口地址池，按运营商线路分组。
+
+    返回 [(线路名, [入口地址...]), ...]
+    - 每个运营商线路（联通/移动）单独一组，组内 = 该线路优选 IP + 静态域名兜底
+    - 生成 nodes.txt 时，每组各出一套节点，备注带 [线路名]，
+      客户端即可按所在地（公司联通 / 家里移动）选择对应分组
+    """
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
     static_hosts = [e.strip() for e in _entry.split(",") if e.strip()] if _entry else EDGE_HOSTS
-    api_hosts = fetch_optimal_api_endpoints(OPTIMAL_API)
-    combined, seen = [], set()
-    for h in static_hosts + api_hosts:
-        if h and h not in seen:
-            seen.add(h)
-            combined.append(h)
-    log("EDGE POOL", f"入口地址池: 静态 {len(static_hosts)} 个, API {len(api_hosts)} 个, 合并 {len(combined)} 个")
-    return combined if combined else EDGE_HOSTS
+
+    groups = []
+    for label, api_url in ISP_LINES:
+        api_hosts = fetch_optimal_api_endpoints(api_url)
+        if not api_hosts:
+            log("EDGE POOL", f"[{label}] 该线路未取到优选IP，改用静态域名兜底")
+        pooled, seen = [], set()
+        for h in api_hosts + static_hosts:      # 线路IP优先，静态域名补位
+            if h and h not in seen:
+                seen.add(h)
+                pooled.append(h)
+        if pooled:
+            groups.append((label, pooled))
+            log("EDGE POOL", f"[{label}] 入口 {len(pooled)} 个 (线路IP {len(api_hosts)} + 静态兜底 {len(pooled)-len(api_hosts)})")
+
+    # 兼容：若显式设置了 OPTIMAL_API，作为额外线路并入
+    if OPTIMAL_API:
+        extra = fetch_optimal_api_endpoints(OPTIMAL_API)
+        if extra:
+            pooled, seen = [], set()
+            for h in extra + static_hosts:
+                if h and h not in seen:
+                    seen.add(h)
+                    pooled.append(h)
+            if pooled:
+                groups.append(("自定义", pooled))
+                log("EDGE POOL", f"[自定义] 入口 {len(pooled)} 个")
+
+    if not groups:
+        groups.append(("通用", EDGE_HOSTS))
+        log("EDGE POOL", "所有线路均失败，回退通用静态域名池")
+    return groups
 
 # ---------------------------------------------------------------------------
 # 筛选 SSTP
@@ -418,30 +458,40 @@ def build_outputs(results, raw_count, sstp_count, source):
         "available": available,
     }
 
-def build_nodes_text(data, edge_hosts):
+def build_nodes_text(data, edge_groups):
+    """
+    生成 nodes.txt：每行 = 入口地址#备注$sstp://...
+
+    edge_groups: [(线路名, [入口地址...]), ...]
+    每条线路各生成一套节点，备注以线路名开头（如 "联通-韩国-住宅-01"），
+    这样在客户端里能直接按「公司联通 / 家里移动」分组挑选。
+    """
     lines = []
-    idx = 0
     ordered = sorted(data["countries"].items(),
                      key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
-    for cname, grp in ordered:
-        code = str(grp.get("code") or "?").upper()
-        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
-        nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1,
-                                                    n.get("latency_ms") is None,
-                                                    n.get("latency_ms") or 0, n.get("host") or ""))
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
-        for i, n in enumerate(res_nodes, 1):
-            entry = edge_hosts[idx % len(edge_hosts)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
-        for i, n in enumerate(dc_nodes, 1):
-            entry = edge_hosts[idx % len(edge_hosts)]
-            idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+    for label, edge_hosts in edge_groups:
+        if not edge_hosts:
+            continue
+        idx = 0
+        for cname, grp in ordered:
+            code = str(grp.get("code") or "?").upper()
+            zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+            nodes = sorted(grp["nodes"], key=lambda n: (0 if n.get("residential") == "residential" else 1,
+                                                        n.get("latency_ms") is None,
+                                                        n.get("latency_ms") or 0, n.get("host") or ""))
+            res_nodes = [n for n in nodes if n.get("residential") == "residential"]
+            dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+            for i, n in enumerate(res_nodes, 1):
+                entry = edge_hosts[idx % len(edge_hosts)]
+                idx += 1
+                lines.append(f"{entry}#{label}-{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            for i, n in enumerate(dc_nodes, 1):
+                entry = edge_hosts[idx % len(edge_hosts)]
+                idx += 1
+                lines.append(f"{entry}#{label}-{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
-def write_outputs(data, edge_hosts):
+def write_outputs(data, edge_groups):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
     data_path = os.path.join(PUBLIC_DIR, "data.json")
     with open(data_path, "w", encoding="utf-8") as f:
@@ -461,7 +511,7 @@ def write_outputs(data, edge_hosts):
 
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
     with open(nodes_path, "w", encoding="utf-8") as f:
-        f.write(build_nodes_text(data, edge_hosts))
+        f.write(build_nodes_text(data, edge_groups))
     return data_path, html_path, nodes_path
 
 # ---------------------------------------------------------------------------
@@ -511,11 +561,14 @@ def main():
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
-    edge_hosts = get_combined_edge_hosts()
-    data_path, html_path, nodes_path = write_outputs(data, edge_hosts)
+    edge_groups = get_combined_edge_hosts()
+    data_path, html_path, nodes_path = write_outputs(data, edge_groups)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
+    total_lines = sum(len(g[1]) for g in edge_groups) * len(success)
+    log("RESULT", f"线路分组: {', '.join(lb for lb, _ in edge_groups)}")
+    log("RESULT", f"nodes.txt 约 {total_lines} 行（每条线路各一套节点，备注前缀区分）")
     if NODES_URL:
         log("USAGE", f"把 {NODES_URL} 填入 edgetunnel 后台「自定义优选IP」框（需开启自定义订阅模式）")
     log("WEBSITE", "完成")
